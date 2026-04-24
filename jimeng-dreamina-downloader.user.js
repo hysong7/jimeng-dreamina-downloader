@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         即梦 & Dreamina 图片/视频下载器
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  一键下载即梦AI图片/视频。自动拦截API响应获取无水印原图，支持图片/视频详情页和列表页。
 // @author       Daniel Song
 // @match        https://jimeng.jianying.com/*
@@ -28,15 +28,23 @@
         SCAN_INTERVAL: 2000,
         // API 白名单域名（只拦截这些域名的请求）
         API_HOSTS: [
-            'jimeng.jianying.com',
-            'dreamina.capcut.com'
+            'jianying.com',
+            'capcut.com',
+            'douyin.com',
+            'bytedance.com'
         ],
-        // CDN 域名白名单
+        // CDN 域名白名单（支持即梦和剪映的所有 CDN）
         CDN_PATTERNS: [
             'byteimg.com',
             'vlabstatic.com',
-            'vlabvod.com',   // 即梦视频 CDN
-            'douyin.com'
+            'vlabvod.com',
+            'douyin.com',
+            'byted-static.net',
+            'pstatp.com',
+            'ixigua.com',
+            'ibytedtos.com',   // Dreamina 用户头像/资源 CDN
+            'lf3-capsule.vlabstatic.com',
+            'lf6-capsule.vlabstatic.com'
         ],
         // 优先尝试的高清尺寸
         PREFERRED_SIZES: [2048, 1920, 1080, 900],
@@ -107,10 +115,51 @@
         isCDNUrl(url) {
             if (!url || typeof url !== 'string') return false;
             if (!url.startsWith('http')) return false;
+            // 排除明显不是资源的外链域名
+            const skipDomains = [
+                'google.com', 'googleapis.com', 'googleadservices.com',
+                'doubleclick.net', 'googlesyndication.com',
+                'facebook.com', 'fbcdn.net', 'instagram.com',
+                'twitter.com', 'x.com', 't.co',
+                'baidu.com', 'bdstatic.com',
+                'aliyun.com', 'alipay.com', 'alibaba.com',
+                'amazonaws.com', 'cloudfront.net',
+                'segment.com', 'mixpanel.com', 'amplitude.com',
+                'hotjar.com', 'fullstory.com',
+                'sentry.io', 'bugsnag.com',
+                'intercom.io', 'zendesk.com', 'crisp.chat',
+                'youtube.com', 'ytimg.com', 'googlevideo.com',
+                'vimeo.com',
+                'github.com', 'githubusercontent.com',
+                'cdn.cookielaw.org', 'privacy-mgmt.com',
+                'onesignal.com', 'pushwoosh.com',
+                'amplitude', 'segment', 'mixpanel',
+            ];
+            try {
+                const u2 = new URL(url);
+                const host = u2.hostname.toLowerCase();
+                if (skipDomains.some(d => host.includes(d))) return false;
+            } catch {}
+
             // 标准 CDN 域名
             if (CONFIG.CDN_PATTERNS.some(p => url.includes(p))) return true;
-            // ByteDance 视频 CDN：obj/video、obj/videodb 等路径
-            if (url.includes('/obj/video') || url.includes('/obj/videodb')) return true;
+            // ByteDance 视频 CDN 路径
+            if (/\/obj\/(video|videodb|bytedance)/i.test(url)) return true;
+            // 包含媒体路径关键词
+            if (/\/(obj|video|image|img|media|asset|tos-cn|thumb|bucket|cover|preview)\//i.test(url)) return true;
+            // ByteDance 特有 URL 后缀
+            if (url.includes('~tplv') || url.includes('~cbpeditor')) return true;
+            // 直接文件扩展名（常见媒体格式）
+            if (/\.(png|jpg|jpeg|webp|gif|mp4|webm|mov|avi|mkv)(\?|&|$|#)/i.test(url)) return true;
+            // 包含 mime_type=video_ 参数
+            if (/mime_type=video_/i.test(url)) return true;
+            // 包含常见的 CDN 签名参数
+            if (/(&|\?)lk3s=/.test(url) || /(&|\?)x-expires=/.test(url) || /(&|\?)x-signature=/.test(url)) return true;
+            // 来自 Dreamina/CapCut API 的资源 URL
+            if (url.includes('dreamina-api.') || url.includes('.capcut.com') || url.includes('.bytedance.com')) {
+                // 有路径参数包含数字 ID 的，大概率是资源 URL
+                if (/\/([\w-]+)\?.*(token|key|sign|auth|bid|a_bogus|lk3s)=/i.test(url)) return true;
+            }
             return false;
         },
 
@@ -299,12 +348,15 @@
             log.i('API 拦截器初始化完成');
         },
 
-        isInterestingRequest(url) {
+isInterestingRequest(url) {
             if (!url) return false;
             try {
                 const u = new URL(url, location.href);
                 const host = u.hostname;
-                // 必须在白名单主机上（jimeng/dreamina 的所有 API）
+                // capcut.com / dreamina.capcut.com 域名：拦截所有跨域请求（大概率是 API）
+                const isCapcut = host.includes('capcut.com') || host.includes('bytedance.com');
+                if (isCapcut) return true;
+                // jianying.com / douyin.com：必须在白名单主机上
                 const hostOk = CONFIG.API_HOSTS.some(h => host.includes(h));
                 if (!hostOk) return false;
                 // 必须是 /mweb/ 或 /api/ 路径
@@ -376,7 +428,7 @@
 
         // 从响应数据中递归提取 CDN URL
         extractResources(obj, depth = 0) {
-            if (depth > 10 || !obj || typeof obj !== 'object') return;
+            if (depth > 15 || !obj || typeof obj !== 'object') return;
 
             if (Array.isArray(obj)) {
                 obj.forEach(item => this.extractResources(item, depth + 1));
@@ -384,8 +436,8 @@
             }
 
             for (const [key, value] of Object.entries(obj)) {
-                // 跳过大型数据字段，避免性能问题
-                if (key === 'prompt' || key === 'prompt_tags' || key === 'description') continue;
+                // 跳过超长文本字段，避免无谓扫描
+                if (typeof value === 'string' && value.length > 20000) continue;
                 if (typeof value === 'string' && U.isCDNUrl(value)) {
                     this.handleFoundUrl(value, key);
                 } else if (typeof value === 'object' && value !== null) {
